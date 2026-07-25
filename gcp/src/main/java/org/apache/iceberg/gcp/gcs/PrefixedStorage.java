@@ -28,6 +28,7 @@ import com.google.cloud.storage.StorageOptions;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Map;
+import java.util.function.Supplier;
 import org.apache.iceberg.EnvironmentContext;
 import org.apache.iceberg.gcp.GCPAuthUtils;
 import org.apache.iceberg.gcp.GCPProperties;
@@ -42,10 +43,14 @@ class PrefixedStorage implements AutoCloseable {
   private final String storagePrefix;
   private final GCPProperties gcpProperties;
   private final Map<String, String> propertiesWithUserAgent;
+
+  // Null when analytics-core is disabled. Resolves the shared file system on each call; see
+  // AnalyticsCoreUtil#fileSystemSupplier.
+  private final Supplier<AutoCloseable> fileSystemSupplier;
+
   private SerializableSupplier<Storage> storage;
   private CloseableGroup closeableGroup;
   private transient volatile Storage storageClient;
-  private transient volatile AutoCloseable gcsFileSystem;
 
   PrefixedStorage(
       String storagePrefix, Map<String, String> properties, SerializableSupplier<Storage> storage) {
@@ -60,6 +65,10 @@ class PrefixedStorage implements AutoCloseable {
             .putAll(properties)
             .put("gcs.user-agent", GCS_FILE_IO_USER_AGENT)
             .build();
+    this.fileSystemSupplier =
+        gcpProperties.isGcsAnalyticsCoreEnabled()
+            ? AnalyticsCoreUtil.fileSystemSupplier(propertiesWithUserAgent, storagePrefix)
+            : null;
     this.closeableGroup = new CloseableGroup();
     if (null == storage) {
       this.storage =
@@ -107,18 +116,11 @@ class PrefixedStorage implements AutoCloseable {
   @Override
   public void close() {
     try {
-      try {
-        if (null != closeableGroup) {
-          closeableGroup.close();
-        }
-      } catch (IOException ioe) {
-        throw new UncheckedIOException(ioe);
-      } finally {
-        if (null != gcsFileSystem) {
-          AnalyticsCoreUtil.close(gcsFileSystem);
-          gcsFileSystem = null;
-        }
+      if (null != closeableGroup) {
+        closeableGroup.close();
       }
+    } catch (IOException ioe) {
+      throw new UncheckedIOException(ioe);
     } finally {
       if (null != storage) {
         // GCS Storage does not appear to be closable, so release the reference
@@ -127,43 +129,111 @@ class PrefixedStorage implements AutoCloseable {
     }
   }
 
-  // Returns AutoCloseable to avoid a runtime dependency on gcs-analytics-core. Cast via
-  // AnalyticsCoreUtil.
+  /**
+   * Returns the analytics-core file system for this storage, or null when analytics-core is
+   * disabled. The file system is shared with other storages holding the same credentials and
+   * configuration and is owned by {@link GcsFileSystemCache}, so it outlives this storage and must
+   * not be closed here.
+   *
+   * <p>Returns AutoCloseable to avoid a runtime dependency on gcs-analytics-core. Cast via
+   * AnalyticsCoreUtil.
+   */
   AutoCloseable gcsFileSystem() {
-    if (!gcpProperties.isGcsAnalyticsCoreEnabled()) {
-      return null;
-    }
-
-    if (gcsFileSystem == null) {
-      synchronized (this) {
-        if (gcsFileSystem == null) {
-          this.gcsFileSystem =
-              AnalyticsCoreUtil.createFileSystem(
-                  propertiesWithUserAgent, credentials(gcpProperties));
-        }
-      }
-    }
-
-    return gcsFileSystem;
+    return null != fileSystemSupplier ? fileSystemSupplier.get() : null;
   }
 
-  private Credentials credentials(GCPProperties properties) {
+  /** The credential mechanism a configuration selects. */
+  private enum AuthType {
+    TOKEN,
+    NO_AUTH,
+    IMPERSONATION,
+    APPLICATION_DEFAULT
+  }
+
+  /**
+   * Returns the credential mechanism {@code properties} selects. This is the single place the
+   * precedence between mechanisms is defined, so that credentials and the credential scope derived
+   * from them cannot disagree about which one applies.
+   */
+  private static AuthType authType(GCPProperties properties) {
     // Google Cloud APIs default to automatically detect the credentials to use, which is
     // in most cases the convenient way, especially in GCP.
     // See javadoc of com.google.auth.oauth2.GoogleCredentials.getApplicationDefault()
     if (properties.oauth2Token().isPresent()) {
-      return GCPAuthUtils.oauth2CredentialsFromGcpProperties(properties, closeableGroup);
+      return AuthType.TOKEN;
     } else if (properties.noAuth()) {
       // Explicitly allow "no credentials" for testing purposes
-      return NoCredentials.getInstance();
+      return AuthType.NO_AUTH;
     } else if (properties.impersonateServiceAccount().isPresent()) {
-      return buildImpersonatedCredentials(properties);
+      return AuthType.IMPERSONATION;
     } else {
-      return null;
+      return AuthType.APPLICATION_DEFAULT;
     }
   }
 
-  private Credentials buildImpersonatedCredentials(GCPProperties properties) {
+  private Credentials credentials(GCPProperties properties) {
+    return credentialsFrom(properties, closeableGroup);
+  }
+
+  /**
+   * Builds credentials for {@code properties}, registering anything that needs closing (such as a
+   * vended credentials refresh handler) with {@code closeables}.
+   */
+  static Credentials credentialsFrom(GCPProperties properties, CloseableGroup closeables) {
+    switch (authType(properties)) {
+      case TOKEN:
+        return GCPAuthUtils.oauth2CredentialsFromGcpProperties(properties, closeables);
+      case NO_AUTH:
+        return NoCredentials.getInstance();
+      case IMPERSONATION:
+        return buildImpersonatedCredentials(properties);
+      case APPLICATION_DEFAULT:
+        return null;
+      default:
+        throw new IllegalStateException("Unknown auth type: " + authType(properties));
+    }
+  }
+
+  /**
+   * Returns an identifier for the authorization {@code properties} carries, used to keep file
+   * systems with different access from sharing cached object data.
+   *
+   * <p>Values that identify equal access must produce equal scopes and nothing else may: an
+   * over-specific scope only costs cache hits, while an under-specific one lets a caller read data
+   * fetched with credentials it does not hold.
+   *
+   * <p>A scope can carry a credential, as {@link org.apache.iceberg.rest.auth.AuthSessionCache}
+   * keys do, so it must not be logged.
+   */
+  static String credentialScope(GCPProperties properties, String storagePrefix) {
+    switch (authType(properties)) {
+      case TOKEN:
+        // The token is the grant itself, so equal tokens mean equal access however the token was
+        // obtained.
+        return storagePrefix + "|token:" + properties.oauth2Token().get();
+      case NO_AUTH:
+        // Unauthenticated callers all have the same (empty) authorization. The endpoint they reach
+        // is part of the file system options, which are the other half of the cache key.
+        return storagePrefix + "|no-auth";
+      case IMPERSONATION:
+        // Delegates and scopes change what the minted credential can do and who is allowed to mint
+        // it, so both are part of the identity, not just the target service account.
+        return storagePrefix
+            + "|service-account:"
+            + properties.impersonateServiceAccount().get()
+            + "|delegates:"
+            + properties.impersonateDelegates()
+            + "|scopes:"
+            + properties.impersonateScopes();
+      case APPLICATION_DEFAULT:
+        // Application default credentials resolve to a single identity per process.
+        return storagePrefix + "|application-default";
+      default:
+        throw new IllegalStateException("Unknown auth type: " + authType(properties));
+    }
+  }
+
+  private static Credentials buildImpersonatedCredentials(GCPProperties properties) {
     try {
       GoogleCredentials sourceCredentials = GoogleCredentials.getApplicationDefault();
 
