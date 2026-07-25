@@ -769,6 +769,8 @@ project(':iceberg-gcp') {
     compileOnly "com.google.cloud:google-cloud-storage"
     compileOnly "com.google.cloud:google-cloud-kms"
     compileOnly(libs.gcs.analytics.core)
+    // Only used alongside gcs-analytics-core, which brings it at runtime
+    compileOnly libs.caffeine
 
     testImplementation "com.google.cloud:google-cloud-nio"
 
