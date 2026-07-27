@@ -25,14 +25,21 @@ import com.google.cloud.gcs.analyticscore.client.GcsClientOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsReadOptions;
+import com.google.cloud.gcs.analyticscore.client.GcsWriteOptions;
 import java.util.Map;
 import org.apache.iceberg.EnvironmentContext;
 import org.apache.iceberg.gcp.GCPProperties;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 @SuppressWarnings("resource")
 public class TestPrefixedStorage {
+
+  @AfterEach
+  public void after() {
+    GcsFileSystem.invalidateInstances();
+  }
 
   @Test
   public void invalidParameters() {
@@ -151,6 +158,11 @@ public class TestPrefixedStorage {
                             .setDecryptionKey("decryptionKey")
                             .setUserProjectId("userProject")
                             .build())
+                    .setGcsWriteOptions(
+                        GcsWriteOptions.builder()
+                            .setUserProject("userProject")
+                            .setEncryptionKey("encryptionKey")
+                            .build())
                     .build())
             .build();
 
@@ -159,5 +171,66 @@ public class TestPrefixedStorage {
     assertThat(fileSystem).isNotNull();
     assertThat(fileSystem.getGcsClient()).isNotNull();
     assertThat(fileSystem.getFileSystemOptions()).isEqualTo(expectedOptions);
+
+    storage.close();
+  }
+
+  @Test
+  public void gcsFileSystemIsSharedByCredentialScope() {
+    Map<String, String> properties = analyticsCoreProperties("token");
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage sameCredentials = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage otherCredentials =
+        new PrefixedStorage("gs://bucket", analyticsCoreProperties("other-token"), null);
+
+    assertThat(storage.gcsFileSystem()).isSameAs(sameCredentials.gcsFileSystem());
+    assertThat(storage.gcsFileSystem()).isNotSameAs(otherCredentials.gcsFileSystem());
+  }
+
+  @Test
+  public void gcsFileSystemIsNotSharedAcrossStoragePrefixes() {
+    Map<String, String> properties = analyticsCoreProperties("token");
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage otherBucket = new PrefixedStorage("gs://other-bucket", properties, null);
+
+    assertThat(storage.gcsFileSystem()).isNotSameAs(otherBucket.gcsFileSystem());
+  }
+
+  @Test
+  public void gcsFileSystemIsNotSharedAcrossFileSystemOptions() {
+    Map<String, String> properties = analyticsCoreProperties("token");
+    Map<String, String> otherOptions =
+        ImmutableMap.<String, String>builder()
+            .putAll(properties)
+            .put(GCPProperties.GCS_CHANNEL_READ_CHUNK_SIZE, "1024")
+            .build();
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage otherStorage = new PrefixedStorage("gs://bucket", otherOptions, null);
+
+    assertThat(storage.gcsFileSystem()).isNotSameAs(otherStorage.gcsFileSystem());
+  }
+
+  @Test
+  public void gcsFileSystemOutlivesTheStorageThatCreatedIt() {
+    Map<String, String> properties = analyticsCoreProperties("token");
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    AutoCloseable fileSystem = storage.gcsFileSystem();
+
+    // the cache owns the file system, so closing a storage must not close or drop it
+    storage.close();
+
+    PrefixedStorage reopened = new PrefixedStorage("gs://bucket", properties, null);
+
+    assertThat(reopened.gcsFileSystem()).isSameAs(fileSystem);
+  }
+
+  private static Map<String, String> analyticsCoreProperties(String token) {
+    return ImmutableMap.of(
+        GCPProperties.GCS_ANALYTICS_CORE_ENABLED,
+        "true",
+        GCPProperties.GCS_SERVICE_HOST,
+        "example.com",
+        GCPProperties.GCS_OAUTH2_TOKEN,
+        token);
   }
 }

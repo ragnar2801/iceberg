@@ -18,15 +18,14 @@
  */
 package org.apache.iceberg.gcp.gcs;
 
-import com.google.auth.Credentials;
+import com.google.cloud.NoCredentials;
+import com.google.cloud.gcs.analyticscore.client.GcsAuthType;
+import com.google.cloud.gcs.analyticscore.client.GcsCredentials;
 import com.google.cloud.gcs.analyticscore.client.GcsFileInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
-import com.google.cloud.gcs.analyticscore.client.GcsFileSystemImpl;
-import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsItemId;
 import com.google.cloud.gcs.analyticscore.client.GcsItemInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsObjectRange;
-import com.google.cloud.gcs.analyticscore.core.GcsAnalyticsCoreOptions;
 import com.google.cloud.gcs.analyticscore.core.GoogleCloudStorageInputStream;
 import com.google.cloud.storage.BlobId;
 import java.io.IOException;
@@ -36,7 +35,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.IntFunction;
 import java.util.stream.Collectors;
+import org.apache.iceberg.gcp.GCPAuthUtils;
 import org.apache.iceberg.gcp.GCPProperties;
+import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.FileIOMetricsContext;
 import org.apache.iceberg.io.FileRange;
 import org.apache.iceberg.io.RangeReadable;
@@ -54,18 +55,54 @@ import org.apache.iceberg.util.PropertyUtil;
  */
 class AnalyticsCoreUtil {
 
+  private static final String GCS_PROPERTY_PREFIX = "gcs.";
+
   private AnalyticsCoreUtil() {}
 
-  static AutoCloseable createFileSystem(Map<String, String> properties, Credentials credentials) {
+  /**
+   * Returns the file system for {@code properties}, shared with every other caller whose properties
+   * carry the same authorization and configuration. Analytics-core owns it, so it must not be
+   * closed here, and it is looked up per use so that one in use cannot expire underneath its user.
+   */
+  static AutoCloseable getFileSystem(Map<String, String> properties, String storagePrefix) {
     Preconditions.checkState(
         PropertyUtil.propertyAsBoolean(properties, GCPProperties.GCS_ANALYTICS_CORE_ENABLED, false),
         "GCS analytics-core is disabled; %s must be set to true",
         GCPProperties.GCS_ANALYTICS_CORE_ENABLED);
-    GcsAnalyticsCoreOptions options = new GcsAnalyticsCoreOptions("gcs.", properties);
-    GcsFileSystemOptions fileSystemOptions = options.getGcsFileSystemOptions();
-    return credentials == null
-        ? new GcsFileSystemImpl(fileSystemOptions)
-        : new GcsFileSystemImpl(credentials, fileSystemOptions);
+
+    return GcsFileSystem.getOrCreate(
+        properties, GCS_PROPERTY_PREFIX, storagePrefix, () -> credentials(properties));
+  }
+
+  /**
+   * Builds the credentials for a file system analytics-core is about to create, dispatching on the
+   * same {@link GcsAuthType} the cache key is derived from so the two cannot disagree. The switch
+   * is exhaustive and has no default branch, so a mechanism added to that enum becomes a compile
+   * error here rather than silently giving two grants the same key.
+   *
+   * <p>Called only on a cache miss. Resources the credentials own are closed with the shared file
+   * system rather than with the {@code GCSFileIO} that happened to create it.
+   */
+  private static GcsCredentials credentials(Map<String, String> properties) {
+    GCPProperties gcpProperties = new GCPProperties(properties);
+    return switch (GcsAuthType.of(properties, GCS_PROPERTY_PREFIX)) {
+      case TOKEN -> oauth2Credentials(gcpProperties);
+      case NO_AUTH -> GcsCredentials.of(NoCredentials.getInstance());
+      case IMPERSONATION ->
+          GcsCredentials.of(PrefixedStorage.buildImpersonatedCredentials(gcpProperties));
+      case APPLICATION_DEFAULT -> GcsCredentials.applicationDefault();
+    };
+  }
+
+  /**
+   * Builds OAuth2 credentials, handing over the group holding the refresh handler that keeps a
+   * vended token current. The group is empty for a plain token, making its close a no-op.
+   */
+  private static GcsCredentials oauth2Credentials(GCPProperties properties) {
+    CloseableGroup refreshResources = new CloseableGroup();
+    return GcsCredentials.of(
+        GCPAuthUtils.oauth2CredentialsFromGcpProperties(properties, refreshResources),
+        refreshResources);
   }
 
   static SeekableInputStream newStream(
@@ -79,12 +116,6 @@ class AnalyticsCoreUtil {
             : GoogleCloudStorageInputStream.create(
                 fileSystem, gcsFileInfo(blobId, itemId, blobSize));
     return new GcsInputStreamWrapper(stream, blobId, metrics);
-  }
-
-  static void close(AutoCloseable fileSystemHandle) {
-    if (fileSystemHandle != null) {
-      ((GcsFileSystem) fileSystemHandle).close();
-    }
   }
 
   private static GcsItemId gcsItemId(BlobId blobId) {
