@@ -23,16 +23,26 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.google.cloud.gcs.analyticscore.client.GcsClientOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
+import com.google.cloud.gcs.analyticscore.client.GcsFileSystemCache;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsReadOptions;
 import java.util.Map;
 import org.apache.iceberg.EnvironmentContext;
 import org.apache.iceberg.gcp.GCPProperties;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 @SuppressWarnings("resource")
 public class TestPrefixedStorage {
+
+  // GcsFileSystemCache is JVM-wide static state, so isolate each test from the others.
+  @BeforeEach
+  @AfterEach
+  public void resetFileSystemCache() {
+    GcsFileSystemCache.invalidateAll();
+  }
 
   @Test
   public void invalidParameters() {
@@ -159,5 +169,72 @@ public class TestPrefixedStorage {
     assertThat(fileSystem).isNotNull();
     assertThat(fileSystem.getGcsClient()).isNotNull();
     assertThat(fileSystem.getFileSystemOptions()).isEqualTo(expectedOptions);
+  }
+
+  @Test
+  public void gcsFileSystemIsCachedAcrossLookups() {
+    Map<String, String> properties =
+        ImmutableMap.of(
+            GCPProperties.GCS_ANALYTICS_CORE_ENABLED, "true",
+            GCPProperties.GCS_PROJECT_ID, "myProject");
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+
+    assertThat(storage.gcsFileSystem()).isSameAs(storage.gcsFileSystem());
+  }
+
+  @Test
+  public void gcsFileSystemIsSharedBySameCredentialAndConfig() {
+    Map<String, String> properties =
+        ImmutableMap.of(
+            GCPProperties.GCS_ANALYTICS_CORE_ENABLED, "true",
+            GCPProperties.GCS_PROJECT_ID, "myProject",
+            GCPProperties.GCS_OAUTH2_TOKEN, "token");
+    PrefixedStorage first = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage second = new PrefixedStorage("gs://bucket", properties, null);
+
+    assertThat(first.gcsFileSystem()).isSameAs(second.gcsFileSystem());
+  }
+
+  @Test
+  public void gcsFileSystemIsNotSharedAcrossDifferentCredentials() {
+    Map<String, String> baseProperties =
+        ImmutableMap.of(
+            GCPProperties.GCS_ANALYTICS_CORE_ENABLED, "true",
+            GCPProperties.GCS_PROJECT_ID, "myProject");
+    PrefixedStorage withToken =
+        new PrefixedStorage(
+            "gs://bucket",
+            ImmutableMap.<String, String>builder()
+                .putAll(baseProperties)
+                .put(GCPProperties.GCS_OAUTH2_TOKEN, "token")
+                .build(),
+            null);
+    PrefixedStorage withOtherToken =
+        new PrefixedStorage(
+            "gs://bucket",
+            ImmutableMap.<String, String>builder()
+                .putAll(baseProperties)
+                .put(GCPProperties.GCS_OAUTH2_TOKEN, "other-token")
+                .build(),
+            null);
+
+    assertThat(withToken.gcsFileSystem()).isNotSameAs(withOtherToken.gcsFileSystem());
+  }
+
+  @Test
+  public void closeDoesNotCloseSharedFileSystem() {
+    Map<String, String> properties =
+        ImmutableMap.of(
+            GCPProperties.GCS_ANALYTICS_CORE_ENABLED, "true",
+            GCPProperties.GCS_PROJECT_ID, "myProject");
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    GcsFileSystem fileSystem = (GcsFileSystem) storage.gcsFileSystem();
+
+    storage.close();
+
+    // The cache still owns the file system, so a fresh lookup returns the same live instance.
+    PrefixedStorage reopened = new PrefixedStorage("gs://bucket", properties, null);
+    assertThat(reopened.gcsFileSystem()).isSameAs(fileSystem);
+    assertThat(fileSystem.getGcsClient()).isNotNull();
   }
 }

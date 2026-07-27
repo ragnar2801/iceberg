@@ -21,6 +21,7 @@ package org.apache.iceberg.gcp.gcs;
 import com.google.auth.Credentials;
 import com.google.cloud.gcs.analyticscore.client.GcsFileInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
+import com.google.cloud.gcs.analyticscore.client.GcsFileSystemCache;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemImpl;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsItemId;
@@ -37,6 +38,7 @@ import java.util.Map;
 import java.util.function.IntFunction;
 import java.util.stream.Collectors;
 import org.apache.iceberg.gcp.GCPProperties;
+import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.FileIOMetricsContext;
 import org.apache.iceberg.io.FileRange;
 import org.apache.iceberg.io.RangeReadable;
@@ -56,16 +58,58 @@ class AnalyticsCoreUtil {
 
   private AnalyticsCoreUtil() {}
 
-  static AutoCloseable createFileSystem(Map<String, String> properties, Credentials credentials) {
+  /**
+   * Builds the credentials a file system reads with. Any resource whose lifetime must match the
+   * file system, such as a token refresh handler holding an HTTP client, is registered into the
+   * supplied {@link CloseableGroup} instead of the caller's own resources, so that it is closed with
+   * the file system when its cache entry is evicted. That keeps token refresh working for a file
+   * system shared through {@link GcsFileSystemCache} beyond the caller that created it.
+   */
+  @FunctionalInterface
+  interface CredentialsFactory {
+    /** Returns null to read with application-default credentials. */
+    Credentials create(CloseableGroup credentialResources);
+  }
+
+  /**
+   * Returns a file system shared across callers, keyed by {@code cacheKey}, building it with {@code
+   * credentialsFactory} only on a cache miss. The key is a security boundary: callers reading with
+   * the same key share cached object data, so it must identify the authorization held, not the
+   * principal claimed, and must never be logged. The returned file system is owned by {@link
+   * GcsFileSystemCache} and must not be closed by the caller.
+   */
+  static AutoCloseable getOrCreateFileSystem(
+      String cacheKey, Map<String, String> properties, CredentialsFactory credentialsFactory) {
     Preconditions.checkState(
         PropertyUtil.propertyAsBoolean(properties, GCPProperties.GCS_ANALYTICS_CORE_ENABLED, false),
         "GCS analytics-core is disabled; %s must be set to true",
         GCPProperties.GCS_ANALYTICS_CORE_ENABLED);
-    GcsAnalyticsCoreOptions options = new GcsAnalyticsCoreOptions("gcs.", properties);
-    GcsFileSystemOptions fileSystemOptions = options.getGcsFileSystemOptions();
-    return credentials == null
-        ? new GcsFileSystemImpl(fileSystemOptions)
-        : new GcsFileSystemImpl(credentials, fileSystemOptions);
+    // Options parsing and credential building happen inside the factory so they run only on a cache
+    // miss, not on every lookup of an already-shared file system.
+    return GcsFileSystemCache.getOrCreate(
+        cacheKey, () -> createFileSystem(properties, credentialsFactory));
+  }
+
+  private static GcsFileSystem createFileSystem(
+      Map<String, String> properties, CredentialsFactory credentialsFactory) {
+    GcsFileSystemOptions fileSystemOptions =
+        new GcsAnalyticsCoreOptions("gcs.", properties).getGcsFileSystemOptions();
+    CloseableGroup credentialResources = new CloseableGroup();
+    Credentials credentials = credentialsFactory.create(credentialResources);
+    try {
+      // A null credential reads with application-default credentials and owns no resources.
+      return credentials == null
+          ? new GcsFileSystemImpl(fileSystemOptions)
+          : new GcsFileSystemImpl(credentials, fileSystemOptions, credentialResources);
+    } catch (RuntimeException | Error e) {
+      // The file system never took ownership, so release the credential resources here.
+      try {
+        credentialResources.close();
+      } catch (IOException closeError) {
+        e.addSuppressed(closeError);
+      }
+      throw e;
+    }
   }
 
   static SeekableInputStream newStream(
@@ -79,12 +123,6 @@ class AnalyticsCoreUtil {
             : GoogleCloudStorageInputStream.create(
                 fileSystem, gcsFileInfo(blobId, itemId, blobSize));
     return new GcsInputStreamWrapper(stream, blobId, metrics);
-  }
-
-  static void close(AutoCloseable fileSystemHandle) {
-    if (fileSystemHandle != null) {
-      ((GcsFileSystem) fileSystemHandle).close();
-    }
   }
 
   private static GcsItemId gcsItemId(BlobId blobId) {

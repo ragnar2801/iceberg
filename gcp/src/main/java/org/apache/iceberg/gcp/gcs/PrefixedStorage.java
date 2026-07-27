@@ -27,7 +27,12 @@ import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Map;
+import java.util.TreeMap;
 import org.apache.iceberg.EnvironmentContext;
 import org.apache.iceberg.gcp.GCPAuthUtils;
 import org.apache.iceberg.gcp.GCPProperties;
@@ -45,7 +50,7 @@ class PrefixedStorage implements AutoCloseable {
   private SerializableSupplier<Storage> storage;
   private CloseableGroup closeableGroup;
   private transient volatile Storage storageClient;
-  private transient volatile AutoCloseable gcsFileSystem;
+  private transient volatile String fileSystemCacheKey;
 
   PrefixedStorage(
       String storagePrefix, Map<String, String> properties, SerializableSupplier<Storage> storage) {
@@ -74,7 +79,9 @@ class PrefixedStorage implements AutoCloseable {
             gcpProperties.clientLibToken().ifPresent(builder::setClientLibToken);
             gcpProperties.serviceHost().ifPresent(builder::setHost);
 
-            Credentials credentials = credentials(gcpProperties);
+            // The storage client is owned by this instance, so its credential resources belong in
+            // this instance's closeable group.
+            Credentials credentials = credentials(gcpProperties, closeableGroup);
             if (credentials != null) {
               builder.setCredentials(credentials);
             }
@@ -107,18 +114,13 @@ class PrefixedStorage implements AutoCloseable {
   @Override
   public void close() {
     try {
-      try {
-        if (null != closeableGroup) {
-          closeableGroup.close();
-        }
-      } catch (IOException ioe) {
-        throw new UncheckedIOException(ioe);
-      } finally {
-        if (null != gcsFileSystem) {
-          AnalyticsCoreUtil.close(gcsFileSystem);
-          gcsFileSystem = null;
-        }
+      // The analytics-core file system is owned by GcsFileSystemCache, not by this instance, so it
+      // is intentionally not closed here.
+      if (null != closeableGroup) {
+        closeableGroup.close();
       }
+    } catch (IOException ioe) {
+      throw new UncheckedIOException(ioe);
     } finally {
       if (null != storage) {
         // GCS Storage does not appear to be closable, so release the reference
@@ -134,25 +136,56 @@ class PrefixedStorage implements AutoCloseable {
       return null;
     }
 
-    if (gcsFileSystem == null) {
+    // Look the file system up on every use rather than holding it in a field, so that an entry in
+    // use keeps refreshing its access time in the cache and cannot expire underneath its user. The
+    // credentials are built inside the factory, which runs only on a cache miss, so a shared entry
+    // does not create a throwaway credential and refresh handler on every lookup.
+    return AnalyticsCoreUtil.getOrCreateFileSystem(
+        fileSystemCacheKey(),
+        propertiesWithUserAgent,
+        credentialResources -> credentials(gcpProperties, credentialResources));
+  }
+
+  /**
+   * Derives the cache key that identifies the file system for this instance's credentials and
+   * configuration. The key is hashed over the storage prefix and every property, so that any change
+   * to either — a different credential above all — splits the cache rather than sharing a file
+   * system with the wrong access. The digest keeps the credential-bearing material out of the key
+   * as plaintext; the key must still never be logged.
+   */
+  private String fileSystemCacheKey() {
+    if (fileSystemCacheKey == null) {
       synchronized (this) {
-        if (gcsFileSystem == null) {
-          this.gcsFileSystem =
-              AnalyticsCoreUtil.createFileSystem(
-                  propertiesWithUserAgent, credentials(gcpProperties));
+        if (fileSystemCacheKey == null) {
+          StringBuilder material = new StringBuilder(storagePrefix).append('\n');
+          // Sort so the key does not depend on property iteration order.
+          new TreeMap<>(propertiesWithUserAgent)
+              .forEach((key, value) -> material.append(key).append('=').append(value).append('\n'));
+          try {
+            byte[] digest =
+                MessageDigest.getInstance("SHA-256")
+                    .digest(material.toString().getBytes(StandardCharsets.UTF_8));
+            this.fileSystemCacheKey = HexFormat.of().formatHex(digest);
+          } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is required to be present on every Java platform.
+            throw new IllegalStateException("SHA-256 is not available", e);
+          }
         }
       }
     }
 
-    return gcsFileSystem;
+    return fileSystemCacheKey;
   }
 
-  private Credentials credentials(GCPProperties properties) {
+  private Credentials credentials(GCPProperties properties, CloseableGroup credentialResources) {
     // Google Cloud APIs default to automatically detect the credentials to use, which is
     // in most cases the convenient way, especially in GCP.
     // See javadoc of com.google.auth.oauth2.GoogleCredentials.getApplicationDefault()
     if (properties.oauth2Token().isPresent()) {
-      return GCPAuthUtils.oauth2CredentialsFromGcpProperties(properties, closeableGroup);
+      // The refresh handler, if any, is registered with credentialResources so its lifetime tracks
+      // whoever owns these credentials: this instance's closeable group for the storage client, or
+      // the shared file system for the analytics-core reader.
+      return GCPAuthUtils.oauth2CredentialsFromGcpProperties(properties, credentialResources);
     } else if (properties.noAuth()) {
       // Explicitly allow "no credentials" for testing purposes
       return NoCredentials.getInstance();
