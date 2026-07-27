@@ -45,7 +45,6 @@ class PrefixedStorage implements AutoCloseable {
   private SerializableSupplier<Storage> storage;
   private CloseableGroup closeableGroup;
   private transient volatile Storage storageClient;
-  private transient volatile AutoCloseable gcsFileSystem;
 
   PrefixedStorage(
       String storagePrefix, Map<String, String> properties, SerializableSupplier<Storage> storage) {
@@ -107,18 +106,11 @@ class PrefixedStorage implements AutoCloseable {
   @Override
   public void close() {
     try {
-      try {
-        if (null != closeableGroup) {
-          closeableGroup.close();
-        }
-      } catch (IOException ioe) {
-        throw new UncheckedIOException(ioe);
-      } finally {
-        if (null != gcsFileSystem) {
-          AnalyticsCoreUtil.close(gcsFileSystem);
-          gcsFileSystem = null;
-        }
+      if (null != closeableGroup) {
+        closeableGroup.close();
       }
+    } catch (IOException ioe) {
+      throw new UncheckedIOException(ioe);
     } finally {
       if (null != storage) {
         // GCS Storage does not appear to be closable, so release the reference
@@ -127,24 +119,15 @@ class PrefixedStorage implements AutoCloseable {
     }
   }
 
-  // Returns AutoCloseable to avoid a runtime dependency on gcs-analytics-core. Cast via
-  // AnalyticsCoreUtil.
+  // Shared with every other storage holding the same credentials and configuration, and owned by
+  // analytics-core, so it must not be closed here. Returns AutoCloseable to avoid a runtime
+  // dependency on gcs-analytics-core; cast via AnalyticsCoreUtil.
   AutoCloseable gcsFileSystem() {
     if (!gcpProperties.isGcsAnalyticsCoreEnabled()) {
       return null;
     }
 
-    if (gcsFileSystem == null) {
-      synchronized (this) {
-        if (gcsFileSystem == null) {
-          this.gcsFileSystem =
-              AnalyticsCoreUtil.createFileSystem(
-                  propertiesWithUserAgent, credentials(gcpProperties));
-        }
-      }
-    }
-
-    return gcsFileSystem;
+    return AnalyticsCoreUtil.getFileSystem(propertiesWithUserAgent, storagePrefix);
   }
 
   private Credentials credentials(GCPProperties properties) {
@@ -163,7 +146,9 @@ class PrefixedStorage implements AutoCloseable {
     }
   }
 
-  private Credentials buildImpersonatedCredentials(GCPProperties properties) {
+  // Package-private and static so that AnalyticsCoreUtil can build credentials for a shared file
+  // system, which must not borrow this storage's closeables.
+  static Credentials buildImpersonatedCredentials(GCPProperties properties) {
     try {
       GoogleCredentials sourceCredentials = GoogleCredentials.getApplicationDefault();
 
