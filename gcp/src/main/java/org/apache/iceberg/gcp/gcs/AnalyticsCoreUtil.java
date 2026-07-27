@@ -21,6 +21,7 @@ package org.apache.iceberg.gcp.gcs;
 import com.google.auth.Credentials;
 import com.google.cloud.gcs.analyticscore.client.GcsFileInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
+import com.google.cloud.gcs.analyticscore.client.GcsFileSystemCache;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemImpl;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsItemId;
@@ -35,8 +36,10 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.function.IntFunction;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.iceberg.gcp.GCPProperties;
+import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.FileIOMetricsContext;
 import org.apache.iceberg.io.FileRange;
 import org.apache.iceberg.io.RangeReadable;
@@ -56,16 +59,47 @@ class AnalyticsCoreUtil {
 
   private AnalyticsCoreUtil() {}
 
-  static AutoCloseable createFileSystem(Map<String, String> properties, Credentials credentials) {
+  /**
+   * Returns a supplier of the file system for {@code properties}, shared with other callers holding
+   * the same credentials and configuration. The file system is owned by {@link GcsFileSystemCache}
+   * and must not be closed by the caller.
+   *
+   * <p>The supplier resolves the file system on every call rather than holding it, so that an entry
+   * cannot expire while a caller is still opening files through it. The configuration and cache key
+   * behind it are parsed once, here, leaving each call a single cache lookup.
+   */
+  static Supplier<AutoCloseable> fileSystemSupplier(
+      Map<String, String> properties, String storagePrefix) {
     Preconditions.checkState(
         PropertyUtil.propertyAsBoolean(properties, GCPProperties.GCS_ANALYTICS_CORE_ENABLED, false),
         "GCS analytics-core is disabled; %s must be set to true",
         GCPProperties.GCS_ANALYTICS_CORE_ENABLED);
     GcsAnalyticsCoreOptions options = new GcsAnalyticsCoreOptions("gcs.", properties);
     GcsFileSystemOptions fileSystemOptions = options.getGcsFileSystemOptions();
+    GCPProperties gcpProperties = new GCPProperties(properties);
+    // Options are part of the key because they decide the endpoint and client configuration, which
+    // two callers with equal credentials can still disagree about.
+    String cacheKey =
+        PrefixedStorage.credentialScope(gcpProperties, storagePrefix) + "|" + fileSystemOptions;
+
+    return () ->
+        GcsFileSystemCache.getOrCreate(
+            cacheKey, () -> createFileSystem(gcpProperties, fileSystemOptions));
+  }
+
+  private static GcsFileSystem createFileSystem(
+      GCPProperties gcpProperties, GcsFileSystemOptions fileSystemOptions) {
+    // Credentials are built here rather than passed in by the caller: a shared file system outlives
+    // the GCSFileIO that happened to create it, so closing that FileIO must not shut down the
+    // refresh handler the shared instance relies on to keep its token current. Handing the
+    // resources to the file system ties them to the instance that uses them, and the cache closes
+    // both together.
+    CloseableGroup credentialResources = new CloseableGroup();
+    Credentials credentials = PrefixedStorage.credentialsFrom(gcpProperties, credentialResources);
+
     return credentials == null
         ? new GcsFileSystemImpl(fileSystemOptions)
-        : new GcsFileSystemImpl(credentials, fileSystemOptions);
+        : new GcsFileSystemImpl(credentials, fileSystemOptions, credentialResources);
   }
 
   static SeekableInputStream newStream(
@@ -79,12 +113,6 @@ class AnalyticsCoreUtil {
             : GoogleCloudStorageInputStream.create(
                 fileSystem, gcsFileInfo(blobId, itemId, blobSize));
     return new GcsInputStreamWrapper(stream, blobId, metrics);
-  }
-
-  static void close(AutoCloseable fileSystemHandle) {
-    if (fileSystemHandle != null) {
-      ((GcsFileSystem) fileSystemHandle).close();
-    }
   }
 
   private static GcsItemId gcsItemId(BlobId blobId) {
