@@ -36,15 +36,15 @@ public class TestPrefixedStorage {
 
   @Test
   public void invalidParameters() {
-    assertThatThrownBy(() -> new PrefixedStorage(null, null, null))
+    assertThatThrownBy(() -> new PrefixedStorage(null, null, null, null))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("Invalid storage prefix: null or empty");
 
-    assertThatThrownBy(() -> new PrefixedStorage("", null, null))
+    assertThatThrownBy(() -> new PrefixedStorage("", null, null, null))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("Invalid storage prefix: null or empty");
 
-    assertThatThrownBy(() -> new PrefixedStorage("gs://bucket", null, null))
+    assertThatThrownBy(() -> new PrefixedStorage("gs://bucket", null, null, null))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("Invalid properties: null");
   }
@@ -54,7 +54,7 @@ public class TestPrefixedStorage {
     Map<String, String> properties =
         ImmutableMap.of(
             GCPProperties.GCS_PROJECT_ID, "myProject", GCPProperties.GCS_OAUTH2_TOKEN, "token");
-    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null, null);
 
     assertThat(storage.storage()).isNotNull();
     assertThat(storage.storagePrefix()).isEqualTo("gs://bucket");
@@ -68,7 +68,7 @@ public class TestPrefixedStorage {
             GCPProperties.GCS_PROJECT_ID, "myProject",
             GCPProperties.GCS_OAUTH2_TOKEN, "token",
             GCPProperties.GCS_USER_PROJECT, "myUserProject");
-    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null, null);
 
     assertThat(storage.storage().getOptions().getUserAgent())
         .isEqualTo("gcsfileio/" + EnvironmentContext.get());
@@ -118,7 +118,7 @@ public class TestPrefixedStorage {
   @Test
   public void gcsFileSystemDisabledByDefault() {
     Map<String, String> properties = ImmutableMap.of(GCPProperties.GCS_PROJECT_ID, "myProject");
-    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null, null);
 
     assertThat(storage.gcsFileSystem()).isNull();
   }
@@ -136,7 +136,7 @@ public class TestPrefixedStorage {
             .put(GCPProperties.GCS_ENCRYPTION_KEY, "encryptionKey")
             .put(GCPProperties.GCS_CHANNEL_READ_CHUNK_SIZE, "1024")
             .build();
-    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null);
+    PrefixedStorage storage = new PrefixedStorage("gs://bucket", properties, null, null);
     GcsFileSystemOptions expectedOptions =
         GcsFileSystemOptions.builder()
             .setGcsClientOptions(
