@@ -40,6 +40,7 @@ import org.apache.iceberg.util.SerializableSupplier;
 class PrefixedStorage implements AutoCloseable {
   private static final String GCS_FILE_IO_USER_AGENT = "gcsfileio/" + EnvironmentContext.get();
   private final String storagePrefix;
+  private final String cacheScope;
   private final GCPProperties gcpProperties;
   private final Map<String, String> propertiesWithUserAgent;
   private SerializableSupplier<Storage> storage;
@@ -48,11 +49,15 @@ class PrefixedStorage implements AutoCloseable {
   private transient volatile AutoCloseable gcsFileSystem;
 
   PrefixedStorage(
-      String storagePrefix, Map<String, String> properties, SerializableSupplier<Storage> storage) {
+      String storagePrefix,
+      Map<String, String> properties,
+      SerializableSupplier<Storage> storage,
+      String cacheScope) {
     Preconditions.checkArgument(
         !Strings.isNullOrEmpty(storagePrefix), "Invalid storage prefix: null or empty");
     Preconditions.checkArgument(null != properties, "Invalid properties: null");
     this.storagePrefix = storagePrefix;
+    this.cacheScope = cacheScope;
     this.storage = storage;
     this.gcpProperties = new GCPProperties(properties);
     this.propertiesWithUserAgent =
@@ -139,7 +144,7 @@ class PrefixedStorage implements AutoCloseable {
         if (gcsFileSystem == null) {
           this.gcsFileSystem =
               AnalyticsCoreUtil.createFileSystem(
-                  propertiesWithUserAgent, credentials(gcpProperties));
+                  propertiesWithUserAgent, credentials(gcpProperties), cacheScope);
         }
       }
     }

@@ -189,9 +189,13 @@ public class GCSFileIO implements DelegateFileIO, SupportsStorageCredentials {
         if (null == storageByPrefix) {
           Map<String, PrefixedStorage> localStorageByPrefix = Maps.newHashMap();
 
+          // The root storage handles paths not covered by any vended credential and falls back to
+          // ambient credentials whose authorization scope is unknown to us. It gets no cache scope,
+          // so its analytics-core cache stays private and is never shared across credentials.
           localStorageByPrefix.put(
               ROOT_STORAGE_PREFIX,
-              new PrefixedStorage(ROOT_STORAGE_PREFIX, properties, storageSupplier));
+              new PrefixedStorage(
+                  ROOT_STORAGE_PREFIX, properties, storageSupplier, /* cacheScope= */ null));
           storageCredentials.stream()
               .filter(c -> c.prefix().startsWith(ROOT_STORAGE_PREFIX))
               .collect(Collectors.toList())
@@ -203,12 +207,17 @@ public class GCSFileIO implements DelegateFileIO, SupportsStorageCredentials {
                             .putAll(storageCredential.config())
                             .buildKeepingLast();
 
+                    // The credential's prefix is the authorization boundary the catalog vended, so
+                    // it is a sound scope for a shared analytics-core cache: every reader with this
+                    // prefix is entitled to the same objects. It comes from the vending authority,
+                    // not inferred from observed reads.
                     localStorageByPrefix.put(
                         storageCredential.prefix(),
                         new PrefixedStorage(
                             storageCredential.prefix(),
                             propertiesWithCredentials,
-                            storageSupplier));
+                            storageSupplier,
+                            storageCredential.prefix()));
                   });
           this.storageByPrefix = localStorageByPrefix;
           scheduleCredentialRefresh();

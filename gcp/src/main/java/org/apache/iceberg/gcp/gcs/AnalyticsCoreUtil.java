@@ -19,6 +19,7 @@
 package org.apache.iceberg.gcp.gcs;
 
 import com.google.auth.Credentials;
+import com.google.cloud.gcs.analyticscore.client.GcsCacheOptions;
 import com.google.cloud.gcs.analyticscore.client.GcsFileInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystemImpl;
@@ -56,16 +57,40 @@ class AnalyticsCoreUtil {
 
   private AnalyticsCoreUtil() {}
 
-  static AutoCloseable createFileSystem(Map<String, String> properties, Credentials credentials) {
+  static AutoCloseable createFileSystem(
+      Map<String, String> properties, Credentials credentials, String cacheScope) {
     Preconditions.checkState(
         PropertyUtil.propertyAsBoolean(properties, GCPProperties.GCS_ANALYTICS_CORE_ENABLED, false),
         "GCS analytics-core is disabled; %s must be set to true",
         GCPProperties.GCS_ANALYTICS_CORE_ENABLED);
     GcsAnalyticsCoreOptions options = new GcsAnalyticsCoreOptions("gcs.", properties);
-    GcsFileSystemOptions fileSystemOptions = options.getGcsFileSystemOptions();
+    GcsFileSystemOptions fileSystemOptions =
+        withCacheScope(options.getGcsFileSystemOptions(), cacheScope);
     return credentials == null
         ? new GcsFileSystemImpl(fileSystemOptions)
         : new GcsFileSystemImpl(credentials, fileSystemOptions);
+  }
+
+  /**
+   * Stamps the analytics-core cache scope onto the file system options.
+   *
+   * <p>The scope partitions the (potentially JVM-shared) analytics-core cache by authorization
+   * boundary, so cached bytes read under one credential are never served to a file system created
+   * for a different one. It is passed as a typed argument rather than through the properties map
+   * precisely because it is a security boundary: a value in the caller-controlled properties map
+   * could be set to another principal's scope. Only a scope derived from a vended credential's
+   * grant is threaded here; when {@code cacheScope} is null or blank (for example, the unscoped
+   * root storage that falls back to ambient credentials) the options are left untouched and the
+   * cache stays private to the file system instance.
+   */
+  private static GcsFileSystemOptions withCacheScope(
+      GcsFileSystemOptions fileSystemOptions, String cacheScope) {
+    if (cacheScope == null || cacheScope.isEmpty()) {
+      return fileSystemOptions;
+    }
+    GcsCacheOptions scopedCacheOptions =
+        fileSystemOptions.getGcsCacheOptions().toBuilder().setCacheScope(cacheScope).build();
+    return fileSystemOptions.toBuilder().setGcsCacheOptions(scopedCacheOptions).build();
   }
 
   static SeekableInputStream newStream(
